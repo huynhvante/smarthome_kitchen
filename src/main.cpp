@@ -14,7 +14,7 @@
 
 DHT dht;
 #define pinDHT 4
-#define timedelay 500
+#define timedelay 1000
 
 
 // OLED config
@@ -25,6 +25,10 @@ DHT dht;
 #define OLED_H    64
 #define OLED_RST  -1
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RST);
+
+
+#define MQ2_PIN 5
+
 
 void setup() {
   Serial.begin(115200);
@@ -78,7 +82,18 @@ void readDHT22(float &temperature, float &humidity) {
   Serial.printf("Temperature: %.1f C, Humidity: %.1f %%\n", temperature, humidity);
 }
 
-void oledDisplay(float temperature, float humidity) {
+void readGas(float &voltage) {
+  int gasValue = analogRead(MQ2_PIN);
+  voltage = gasValue * (3.3 / 4095.0); // Chuyển đổi giá trị ADC sang điện áp
+  Serial.printf("Gas Sensor Voltage: %.2f V\n", voltage);
+  Serial.print("Gas Value: ");
+  Serial.println(gasValue);
+  if(voltage > 2.0){
+    Serial.println("Canh bao khi gas/khoi!");
+  }
+}
+
+void oledDisplay(float temperature, float humidity, float gasVoltage) {
 
   display.clearDisplay();
 
@@ -102,8 +117,10 @@ void oledDisplay(float temperature, float humidity) {
 
 void loop() {
   float temperature, humidity;
+  float voltage;
   readDHT22(temperature, humidity);
-  oledDisplay(temperature, humidity);
+  readGas(voltage);
+  oledDisplay(temperature, humidity, voltage);
 
   // if temperature or humidity is NAN, skip motor control
   if (isnan(temperature) || isnan(humidity)) {
@@ -120,4 +137,5 @@ void loop() {
   else {
     stopMotor();
   }
+  delay(timedelay);
 }
