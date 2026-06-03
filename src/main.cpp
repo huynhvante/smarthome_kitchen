@@ -28,7 +28,9 @@ Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RST);
 
 
 #define MQ2_PIN 5
+#define MQ2_THRESHOLD 2.0 // Điện áp ngưỡng để cảnh báo khi có khí hoặc khói
 
+#define buzzerPin 45
 
 void setup() {
   Serial.begin(115200);
@@ -38,6 +40,8 @@ void setup() {
 
   ledcAttachPin(INA, PWM_CHANNEL_A);
   ledcAttachPin(INB, PWM_CHANNEL_B);
+
+  pinMode(buzzerPin, OUTPUT);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED not found"); 
@@ -52,8 +56,12 @@ void setup() {
   display.println("System Starting...");
   display.display();
 
-  delay(2000);
-
+  Serial.println("MQ2 warming up... 30s");
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("MQ2 Warming up...");
+  display.display();
+  delay(30000); // chờ 30 giây tối thiểu để MQ2 ổn định trước khi đọc giá trị
 }
 
 // Điều khiển quạt quay với tốc độ speed
@@ -88,7 +96,7 @@ void readGas(float &voltage) {
   Serial.printf("Gas Sensor Voltage: %.2f V\n", voltage);
   Serial.print("Gas Value: ");
   Serial.println(gasValue);
-  if(voltage > 2.0){
+  if(voltage > MQ2_THRESHOLD) {
     Serial.println("Canh bao khi gas/khoi!");
   }
 }
@@ -128,14 +136,15 @@ void loop() {
     return;
   }
 
-  // nếu nhiệt độ lớn hơn 30 độ C hoặc độ ẩm lớn hơn 70%, quạt quay
-  if (temperature > 30.0 && humidity > 75.0) {
+  // nếu nhiệt độ lớn hơn 30 độ C hoặc độ ẩm lớn hơn 85.0%, quạt quay
+  if (temperature > 30.0 && humidity > 85.0 || voltage > MQ2_THRESHOLD) {
     forward(speed_fan); 
-    
+    digitalWrite(buzzerPin, HIGH);
   }
 
   else {
     stopMotor();
+    digitalWrite(buzzerPin, LOW);
   }
   delay(timedelay);
 }
