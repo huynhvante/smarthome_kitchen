@@ -1,150 +1,232 @@
 #include <Arduino.h>
 #include "DHT.h"
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
+// ───── WIFI ─────
+const char* WIFI_SSID = "Xuan Tri";
+const char* WIFI_PASS = "08041992";
+
+// ───── MQTT ─────
+const char* MQTT_BROKER = "192.168.1.8";
+const int MQTT_PORT = 1883;
+const char* MQTT_ID = "esp32_kitchen";
+
+// ───── TOPIC ─────
+  // publish
+const char* T_TEMP  = "smarthome/kitchen/temp";
+const char* T_GAS   = "smarthome/kitchen/gas";
+  // subscribe
+const char* T_LED   = "smarthome/kitchen/alert_led";
+
+const char* T_STATUS = "smarthome/kitchen/status";
+
+// ───── PIN ─────
+#define DHTPIN 4
+#define MQ2_PIN 5
+
+#define LED_PIN 36
+#define BUZZER 45
 
 #define INA 18
 #define INB 19
-#define PWM_CHANNEL_A 0
-#define PWM_CHANNEL_B 1
+
+#define PWM_A 0
+#define PWM_B 1
 #define PWM_FREQ 5000
-#define PWM_RESOLUTION 8   // 0-255
-#define speed_fan 200
+#define PWM_RES 8
+#define FAN_SPEED 200
 
 DHT dht;
-#define pinDHT 4
-#define timedelay 1000
+WiFiClient wifi;
+PubSubClient mqtt(wifi);
+
+// ───── STATE ─────
+bool manualMode = false;
+bool fanState = false;
+bool ledState = false;
+bool buzzerState = false;
+
+// ───── WIFI ─────
+void wifiConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("WiFi connecting");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi OK");
+    Serial.print("ESP IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+  } else {
+    Serial.println("\nWiFi FAILED!");
+  }
+}
+
+// ───── ACTUATOR ─────
+void fanOn() {
+  ledcWrite(PWM_A, 0);
+  ledcWrite(PWM_B, FAN_SPEED);
+  fanState = true;
+}
+
+void fanOff() {
+  ledcWrite(PWM_A, 0);
+  ledcWrite(PWM_B, 0);
+  fanState = false;
+}
+
+// ───── MQTT CALLBACK ─────
+void callback(char* topic, byte* payload, unsigned int len) {
+
+  char msg[32];
+  memcpy(msg, payload, len);
+  msg[len] = '\0';
+
+  Serial.printf("[MQTT] %s -> %s\n", topic, msg);
+
+  // Control LED, Fan, Buzzer via alert_led topic
+  if (strcmp(topic, T_LED) == 0) {
+    if (strcmp(msg, "ON") == 0) {
+      manualMode = true;
+      fanOn();
+      digitalWrite(LED_PIN, HIGH);
+      digitalWrite(BUZZER, HIGH);
+      ledState = true;
+      buzzerState = true;
+    } else if (strcmp(msg, "OFF") == 0) {
+      manualMode = true;
+      fanOff();
+      digitalWrite(LED_PIN, LOW);
+      digitalWrite(BUZZER, LOW);
+      ledState = false;
+      buzzerState = false;
+    } else if (strcmp(msg, "AUTO") == 0) {
+      manualMode = false;
+    }
+  }
+}
 
 
-// OLED config
-#define I2C_SDA   8
-#define I2C_SCL   9
-#define OLED_ADDR 0x3C
-#define OLED_W    128
-#define OLED_H    64
-#define OLED_RST  -1
-Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RST);
+// ───── MQTT CONNECT ─────
+void mqttConnect() {
+  Serial.printf("MQTT: Attempting to connect to %s:%d\n", MQTT_BROKER, MQTT_PORT);
+  
+  while (!mqtt.connected()) {
+    Serial.print("MQTT connecting...");
 
+    if (mqtt.connect(MQTT_ID)) {
+      Serial.println("OK");
 
-#define MQ2_PIN 5
-#define MQ2_THRESHOLD 2.0 // Điện áp ngưỡng để cảnh báo khi có khí hoặc khói
+      mqtt.subscribe(T_LED);
 
-#define buzzerPin 45
+      mqtt.publish(T_STATUS, "online", true);
+    } else {
+      Serial.print("FAIL rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" (0=MQTT_CONNECTED, -1=MQTT_CONNECT_FAILED, -2=MQTT_NOT_CONNECTED, -3=MQTT_BROKEN_WIRE, -4=MQTT_REFRESH_REQUIRED)");
+      delay(5000);  // Increased delay to give broker time to respond
+    }
+  }
+}
 
+// ───── SENSOR ─────
+void readSensor(float &t, float &h, float &gasV) {
+  t = dht.getTemperature();
+  h = dht.getHumidity();
+
+  int raw = analogRead(MQ2_PIN);
+  gasV = raw * (3.3f / 4095.0f);
+}
+
+// ───── PUBLISH ─────
+void publish(float t, float h, float gasV) {
+
+  StaticJsonDocument<128> doc;
+  char buf[128];
+
+  doc["temp"] = t;
+  doc["humid"] = h;
+  serializeJson(doc, buf);
+  mqtt.publish(T_TEMP, buf);
+
+  doc.clear();
+  doc["voltage"] = gasV;
+  doc["raw"] = analogRead(MQ2_PIN);
+  serializeJson(doc, buf);
+  mqtt.publish(T_GAS, buf);
+}
+
+// ───── SETUP ─────
 void setup() {
   Serial.begin(115200);
-  dht.setup(pinDHT, DHT::DHT22);
-  ledcSetup(PWM_CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(PWM_CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
 
-  ledcAttachPin(INA, PWM_CHANNEL_A);
-  ledcAttachPin(INB, PWM_CHANNEL_B);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
 
-  pinMode(buzzerPin, OUTPUT);
+  ledcSetup(PWM_A, PWM_FREQ, PWM_RES);
+  ledcSetup(PWM_B, PWM_FREQ, PWM_RES);
+  ledcAttachPin(INA, PWM_A);
+  ledcAttachPin(INB, PWM_B);
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED not found"); 
-    while (1);
-  }
+  dht.setup(DHTPIN, DHT::DHT22);
 
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  wifiConnect();
+  
+  // Wait for WiFi to stabilize before connecting to MQTT
+  delay(2000);
 
-  display.setCursor(0, 0);
-  display.println("System Starting...");
-  display.display();
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setCallback(callback);
 
-  Serial.println("MQ2 warming up... 30s");
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("MQ2 Warming up...");
-  display.display();
-  delay(30000); // chờ 30 giây tối thiểu để MQ2 ổn định trước khi đọc giá trị
+  mqttConnect();
+
+  Serial.println("ESP32 READY");
 }
 
-// Điều khiển quạt quay với tốc độ speed
-void forward(int speed) {
-  ledcWrite(PWM_CHANNEL_A, 0);
-  ledcWrite(PWM_CHANNEL_B, speed);
-}
-
-void stopMotor() {
-  ledcWrite(PWM_CHANNEL_A, 0);
-  ledcWrite(PWM_CHANNEL_B, 0);
-}
-
-// hàm đọc dht
-void readDHT22(float &temperature, float &humidity) {
-  temperature = dht.getTemperature();
-  humidity    = dht.getHumidity();
-
-  if (dht.getStatus() != DHT::ERROR_NONE) {
-    Serial.println("Failed to read from DHT sensor!");
-    temperature = NAN;
-    humidity    = NAN;
-    return;
-  }
-
-  Serial.printf("Temperature: %.1f C, Humidity: %.1f %%\n", temperature, humidity);
-}
-
-void readGas(float &voltage) {
-  int gasValue = analogRead(MQ2_PIN);
-  voltage = gasValue * (3.3 / 4095.0); // Chuyển đổi giá trị ADC sang điện áp
-  Serial.printf("Gas Sensor Voltage: %.2f V\n", voltage);
-  Serial.print("Gas Value: ");
-  Serial.println(gasValue);
-  if(voltage > MQ2_THRESHOLD) {
-    Serial.println("Canh bao khi gas/khoi!");
-  }
-}
-
-void oledDisplay(float temperature, float humidity, float gasVoltage) {
-
-  display.clearDisplay();
-
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("DHT22 Monitor");
-
-  display.setTextSize(2);
-
-  display.setCursor(0, 20);
-  display.print(temperature, 1);
-  display.println(" C");
-
-  display.setCursor(0, 45);
-  display.print(humidity, 1);
-  display.println(" %");
-
-  display.display();
-}
-
-
+// ───── LOOP ─────
 void loop() {
-  float temperature, humidity;
-  float voltage;
-  readDHT22(temperature, humidity);
-  readGas(voltage);
-  oledDisplay(temperature, humidity, voltage);
 
-  // if temperature or humidity is NAN, skip motor control
-  if (isnan(temperature) || isnan(humidity)) {
-    delay(2000); // wait before trying again
-    return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[ERROR] WiFi disconnected, reconnecting...");
+    wifiConnect();
+    delay(2000);  // Wait for network to stabilize
+  }
+  
+  if (!mqtt.connected()) {
+    mqttConnect();
   }
 
-  // nếu nhiệt độ lớn hơn 30 độ C hoặc độ ẩm lớn hơn 85.0%, quạt quay
-  if (temperature > 30.0 && humidity > 85.0 || voltage > MQ2_THRESHOLD) {
-    forward(speed_fan); 
-    digitalWrite(buzzerPin, HIGH);
+  mqtt.loop();
+
+  float t, h, gas;
+  readSensor(t, h, gas);
+
+  Serial.printf("T=%.1f H=%.1f GAS=%.2fV\n", t, h, gas);
+
+  publish(t, h, gas);
+
+  // AUTO MODE fallback
+  if (!manualMode) {
+    if (gas > 2.0) {
+      fanOn();
+      digitalWrite(BUZZER, HIGH);
+      digitalWrite(LED_PIN, HIGH);
+    } else {
+      fanOff();
+      digitalWrite(BUZZER, LOW);
+      digitalWrite(LED_PIN, LOW);
+    }
   }
 
-  else {
-    stopMotor();
-    digitalWrite(buzzerPin, LOW);
-  }
-  delay(timedelay);
+  delay(3000);
 }
