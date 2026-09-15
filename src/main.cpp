@@ -7,7 +7,6 @@
 #define MQ2_PIN 5
 
 #define LED_PIN 36
-#define BUZZER 45
 
 #define INA 18
 #define INB 19
@@ -72,7 +71,6 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
     fanOn();
 
     digitalWrite(LED_PIN,HIGH);
-    digitalWrite(BUZZER,HIGH);
 
     ledState = true;
     buzzerState = true;
@@ -85,7 +83,6 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
     fanOff();
 
     digitalWrite(LED_PIN,LOW);
-    digitalWrite(BUZZER,LOW);
 
     ledState = false;
     buzzerState = false;
@@ -164,7 +161,6 @@ void setup()
   Serial.begin(115200);
 
   pinMode(LED_PIN,OUTPUT);
-  pinMode(BUZZER,OUTPUT);
 
   ledcSetup(PWM_A, PWM_FREQ, PWM_RES);
   ledcSetup(PWM_B, PWM_FREQ, PWM_RES);
@@ -191,13 +187,11 @@ void loop()
     if(gas > 2.0)
     {
       fanOn();
-      digitalWrite(BUZZER, HIGH);
       digitalWrite(LED_PIN, HIGH);
     }
     else
     {
       fanOff();
-      digitalWrite(BUZZER, LOW);
       digitalWrite(LED_PIN, LOW);
     }
   }
