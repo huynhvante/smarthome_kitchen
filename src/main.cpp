@@ -8,10 +8,22 @@
 #define DHTPIN 4
 #define MQ2_PIN 5
 
-#define LED_PIN 36
+#define LED_RED_PIN    36   // LED do: chi dung de canh bao (nhap nhay)
+#define LED_WHITE_PIN  10   // LED trang: chieu sang (MOI)
 
 #define INA 18
 #define INB 19
+
+// ---- Nut nhan tich hop LED ----
+// SIG2: ngo ra trang thai nut (mac dinh HIGH, nhan = LOW)
+// SIG1: ngo vao dieu khien LED nut (mac dinh LOW, HIGH = sang)
+#define BTN_LED_SIG2     6   // Nut vang (den)
+#define BTN_LED_SIG1     7
+#define BTN_FAN_SIG2     8   // Nut xanh (quat)
+#define BTN_FAN_SIG1     9
+#define BTN_DEBOUNCE_MS  30UL
+#define BTN_LONG_PRESS_MS 2000UL       // giu nut bao lau thi ve tu dong
+#define OVERRIDE_RELEASE_MS 1800000UL  // 30 phut sau lan nhan cuoi -> tu ve auto (dat 0 de tat)
 
 #define PWM_A 0
 #define PWM_B 1
@@ -22,6 +34,7 @@
 #define SENSOR_INTERVAL_MS 2000UL
 #define FAN_OFF_DELAY_MS 60000UL
 #define GAS_RAW_THRESHOLD 2200
+#define RED_BLINK_MS 300UL             // chu ky nhap nhay LED do
 
 // ===================== OTA CONFIG =====================
 #define OTA_HOSTNAME        "kitchen-node"
@@ -51,22 +64,81 @@ typedef struct __attribute__((packed)) {
 
 SensorData sensorData;
 
-bool manualMode = false;
+bool manualMode = false;   // manual tu gateway
 bool alertMode = false;
+bool gasDanger = false;    // cap nhat moi chu ky 2s
 bool fanState = false;
-bool ledState = false;
+bool ledState = false;     // trang thai LED TRANG (chieu sang)
 unsigned long lastSensorMs = 0;
+
+// ---- Ghi de tu nut nhan (manual) ----
+bool fanOverride = false;
+bool ledOverride = false;
+unsigned long lastButtonMs = 0;
+
+// ---- Nhap nhay LED do ----
+bool redBlinkState = false;
+unsigned long lastRedBlinkMs = 0;
 
 // OTA state
 volatile bool otaRequested = false;  // dat trong callback ESP-NOW, xu ly trong loop()
 bool otaMode = false;
 unsigned long otaStartMs = 0;
 
+// ===================== BUTTON =====================
+enum BtnEvent { BTN_NONE, BTN_SHORT, BTN_LONG };
+
+struct Button {
+  uint8_t pin;
+  bool lastReading;
+  bool stableState;
+  unsigned long lastChangeMs;
+  unsigned long pressStartMs;
+  bool longFired;
+};
+
+Button btnLed = {BTN_LED_SIG2, HIGH, HIGH, 0, 0, false};
+Button btnFan = {BTN_FAN_SIG2, HIGH, HIGH, 0, 0, false};
+
+// Nhan ngan: tra ve BTN_SHORT khi tha nut.
+// Nhan giu: tra ve BTN_LONG ngay khi du thoi gian (khi dang giu).
+BtnEvent readButton(Button &b)
+{
+  bool reading = digitalRead(b.pin);
+  unsigned long now = millis();
+
+  if (reading != b.lastReading) {
+    b.lastReading = reading;
+    b.lastChangeMs = now;
+  }
+
+  if ((now - b.lastChangeMs) > BTN_DEBOUNCE_MS && reading != b.stableState) {
+    b.stableState = reading;
+    if (b.stableState == LOW) {          // vua nhan xuong
+      b.pressStartMs = now;
+      b.longFired = false;
+    } else if (!b.longFired) {           // vua tha ra, chua phai nhan giu
+      return BTN_SHORT;
+    }
+  }
+
+  if (b.stableState == LOW && !b.longFired &&
+      (now - b.pressStartMs) >= BTN_LONG_PRESS_MS) {
+    b.longFired = true;
+    return BTN_LONG;
+  }
+  return BTN_NONE;
+}
+
 // ===================== ACTUATORS =====================
 void fanOn()
 {
   ledcWrite(PWM_A, 0);
-  ledcWrite(PWM_B, FAN_SPEED);
+  for (int speed = 0; speed <= FAN_SPEED; speed += 10) 
+  {
+    ledcWrite(PWM_B, speed);
+    delay(15);
+  }
   fanState = true;
 }
 
@@ -77,16 +149,88 @@ void fanOff()
   fanState = false;
 }
 
+// LED trang (chieu sang)
 void ledOn()
 {
-  digitalWrite(LED_PIN, HIGH);
+  digitalWrite(LED_WHITE_PIN, HIGH);
   ledState = true;
 }
 
 void ledOff()
 {
-  digitalWrite(LED_PIN, LOW);
+  digitalWrite(LED_WHITE_PIN, LOW);
   ledState = false;
+}
+
+// LED do: nhap nhay khi co canh bao, con lai luon tat. Khong chan (dung millis).
+void updateRedLed()
+{
+  bool alarmActive = alertMode || gasDanger;
+  if (!alarmActive) {
+    if (redBlinkState) {
+      redBlinkState = false;
+      digitalWrite(LED_RED_PIN, LOW);
+    }
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastRedBlinkMs >= RED_BLINK_MS) {
+    lastRedBlinkMs = now;
+    redBlinkState = !redBlinkState;
+    digitalWrite(LED_RED_PIN, redBlinkState ? HIGH : LOW);
+  }
+}
+
+// Den tren CA 2 NUT deu theo trang thai LED trang:
+// LED tat -> 2 den nut sang (SIG1 = HIGH); LED bat -> 2 den nut tat.
+void updateButtonLamps()
+{
+  bool lampOn = !ledState;
+  digitalWrite(BTN_LED_SIG1, lampOn ? HIGH : LOW);
+  digitalWrite(BTN_FAN_SIG1, lampOn ? HIGH : LOW);
+}
+
+// Nhay den trong nut 3 lan de bao "da ve tu dong"
+void blinkLamp(uint8_t pin)
+{
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(pin, HIGH); delay(100);
+    digitalWrite(pin, LOW);  delay(100);
+  }
+}
+
+void handleButtons()
+{
+  // ---- Nut vang: den trang ----
+  BtnEvent e = readButton(btnLed);
+  if (e == BTN_SHORT) {
+    ledOverride = true;
+    lastButtonMs = millis();
+    if (ledState) ledOff(); else ledOn();
+    Serial.printf("Button LED -> %s (MANUAL)\n", ledState ? "ON" : "OFF");
+  } else if (e == BTN_LONG) {
+    ledOverride = false;
+    manualMode = false;
+    blinkLamp(BTN_LED_SIG1);
+    lastSensorMs = millis() - SENSOR_INTERVAL_MS;  // danh gia lai ngay
+    Serial.println("Button LED -> AUTO");
+  }
+
+  // ---- Nut xanh: quat ----
+  e = readButton(btnFan);
+  if (e == BTN_SHORT) {
+    fanOverride = true;
+    lastButtonMs = millis();
+    if (fanState) fanOff(); else fanOn();
+    Serial.printf("Button FAN -> %s (MANUAL)\n", fanState ? "ON" : "OFF");
+  } else if (e == BTN_LONG) {
+    fanOverride = false;
+    manualMode = false;
+    blinkLamp(BTN_FAN_SIG1);
+    lastSensorMs = millis() - SENSOR_INTERVAL_MS;
+    Serial.println("Button FAN -> AUTO");
+  }
 }
 
 // ===================== COMMAND HANDLING =====================
@@ -114,6 +258,8 @@ void applyCommand(const char *command)
   } else if (strcmp(command, "AUTO") == 0) {
     manualMode = false;
     alertMode = false;
+    fanOverride = false;
+    ledOverride = false;
   } else if (strcmp(command, "OTA") == 0) {
     otaRequested = true;  // chi dat co, loop() se xu ly
   }
@@ -197,8 +343,12 @@ void enterOtaMode()
 
   // An toan: tat co cau chap hanh truoc khi nap
   alertMode = false;
+  gasDanger = false;
   fanOff();
   ledOff();
+  digitalWrite(LED_RED_PIN, LOW);
+  redBlinkState = false;
+  updateButtonLamps();
 
   // Ngat ESP-NOW de radio duoc tu do ket noi router
   esp_now_deinit();
@@ -242,14 +392,26 @@ void enterOtaMode()
 void setup()
 {
   Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
+
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_WHITE_PIN, OUTPUT);
+  digitalWrite(LED_RED_PIN, LOW);
   ledOff();
+
+  // Nut nhan: SIG2 la ngo ra cua module (mac dinh HIGH) -> doc vao
+  //           SIG1 la ngo vao cua module (mac dinh LOW)  -> xuat ra
+  pinMode(BTN_LED_SIG2, INPUT_PULLUP);
+  pinMode(BTN_FAN_SIG2, INPUT_PULLUP);
+  pinMode(BTN_LED_SIG1, OUTPUT);
+  pinMode(BTN_FAN_SIG1, OUTPUT);
 
   ledcSetup(PWM_A, PWM_FREQ, PWM_RES);
   ledcSetup(PWM_B, PWM_FREQ, PWM_RES);
   ledcAttachPin(INA, PWM_A);
   ledcAttachPin(INB, PWM_B);
   fanOff();
+
+  updateButtonLamps();
 
   dht.setup(DHTPIN, DHT::DHT22);
 
@@ -272,7 +434,12 @@ void loop()
     return;
   }
 
-  // --- Che do binh thuong ---
+  // --- Nut nhan + LED do nhap nhay: quet lien tuc ---
+  handleButtons();
+  updateButtonLamps();
+  updateRedLed();
+
+  // --- Che do binh thuong (chu ky 2s) ---
   unsigned long now = millis();
   if (now - lastSensorMs < SENSOR_INTERVAL_MS) {
     return;
@@ -283,23 +450,36 @@ void loop()
   int gasRaw;
   readSensor(t, h, gasRaw, gasVoltage);
 
-  Serial.printf("T=%.1f H=%.1f GAS_RAW=%d GAS=%.2fV\n",
-                t, h, gasRaw, gasVoltage);
-  sendData(t, h, gasRaw, gasVoltage);
+  // Tu tra ve auto neu qua lau khong nhan nut (OVERRIDE_RELEASE_MS = 0: tat tinh nang nay)
+  if (OVERRIDE_RELEASE_MS > 0 && (fanOverride || ledOverride) &&
+      (now - lastButtonMs >= OVERRIDE_RELEASE_MS)) {
+    Serial.println("Override timeout: back to AUTO");
+    fanOverride = false;
+    ledOverride = false;
+  }
+
+  gasDanger = gasRaw >= GAS_RAW_THRESHOLD;
+
+  Serial.printf("T=%.1f H=%.1f GAS_RAW=%d GAS=%.2fV DANGER=%d FAN=%d LED=%d | fanMan=%d ledMan=%d gwMan=%d\n",
+                t, h, gasRaw, gasVoltage, gasDanger ? 1 : 0,
+                fanState ? 1 : 0, ledState ? 1 : 0,
+                fanOverride ? 1 : 0, ledOverride ? 1 : 0, manualMode ? 1 : 0);
 
   if (!manualMode) {
-    bool gasDanger = gasRaw >= GAS_RAW_THRESHOLD;
-
     if (alertMode || gasDanger) {
+      // AN TOAN: canh bao luon bat quat + den trang, bo qua nut nhan
+      // (LED do nhap nhay do updateRedLed() xu ly)
+      fanOverride = false;
+      ledOverride = false;
       fanOn();
-    } else {
-      fanOff();
-    }
-
-    if (alertMode || gasDanger) {
       ledOn();
     } else {
-      ledOff();
+      // Binh thuong: chi tu dong khi nut tuong ung KHONG o manual
+      if (!fanOverride) fanOff();
+      if (!ledOverride) ledOff();
     }
   }
+
+  updateButtonLamps();
+  sendData(t, h, gasRaw, gasVoltage);
 }
