@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <ArduinoOTA.h>
+#include <Preferences.h>
 
 // ===================== PIN / PWM =====================
 #define DHTPIN 4
@@ -17,10 +18,10 @@
 // ---- Nut nhan tich hop LED ----
 // SIG2: ngo ra trang thai nut (mac dinh HIGH, nhan = LOW)
 // SIG1: ngo vao dieu khien LED nut (mac dinh LOW, HIGH = sang)
-#define BTN_LED_SIG2     6   // Nut vang (den)
-#define BTN_LED_SIG1     7
-#define BTN_FAN_SIG2     8   // Nut xanh (quat)
-#define BTN_FAN_SIG1     9
+#define BTN_LED_SIG1     6   // Nut vang (den)
+#define BTN_LED_SIG2     7
+#define BTN_FAN_SIG1     8   // Nut xanh (quat)
+#define BTN_FAN_SIG2     9
 #define BTN_DEBOUNCE_MS  30UL
 #define BTN_LONG_PRESS_MS 2000UL       // giu nut bao lau thi ve tu dong
 #define OVERRIDE_RELEASE_MS 1800000UL  // 30 phut sau lan nhan cuoi -> tu ve auto (dat 0 de tat)
@@ -33,8 +34,12 @@
 
 #define SENSOR_INTERVAL_MS 2000UL
 #define FAN_OFF_DELAY_MS 60000UL
-#define GAS_RAW_THRESHOLD 2200
 #define RED_BLINK_MS 300UL             // chu ky nhap nhay LED do
+
+// ---- Nguong gas (raw MQ2): dat tu app -> gateway -> bridge -> node, luu vao flash ----
+#define GAS_TH_DEFAULT 1500            // dung khi chua tung nhan nguong tu app (chinh theo thuc te)
+#define GAS_TH_MIN     50              // phai khop GAS_THRESHOLD_MIN trong gateway.py
+#define GAS_TH_MAX     3000            // phai khop GAS_THRESHOLD_MAX trong gateway.py
 
 // ===================== OTA CONFIG =====================
 #define OTA_HOSTNAME        "kitchen-node"
@@ -45,6 +50,7 @@
 #define OTA_WIFI_TIMEOUT_MS 15000UL    // timeout ket noi WiFi
 
 DHT dht;
+Preferences prefs;
 
 uint8_t gatewayMAC[] = {0x1C, 0xDB, 0xD4, 0xCB, 0xCE, 0xE8};
 
@@ -56,6 +62,7 @@ typedef struct __attribute__((packed)) {
   bool fan;
   bool led;
   bool alarm;
+  float gas_threshold;
 } SensorData;
 
 typedef struct __attribute__((packed)) {
@@ -70,6 +77,10 @@ bool gasDanger = false;    // cap nhat moi chu ky 2s
 bool fanState = false;
 bool ledState = false;     // trang thai LED TRANG (chieu sang)
 unsigned long lastSensorMs = 0;
+
+// ---- Nguong gas ----
+int gasThreshold = GAS_TH_DEFAULT;
+volatile int pendingGasTh = -1;   // dat trong callback ESP-NOW, xu ly trong loop() (khong ghi flash trong callback)
 
 // ---- Ghi de tu nut nhan (manual) ----
 bool fanOverride = false;
@@ -233,6 +244,39 @@ void handleButtons()
   }
 }
 
+// ===================== GAS THRESHOLD =====================
+// Doc nguong da luu trong flash (neu chua co thi dung mac dinh)
+void loadGasThreshold()
+{
+  prefs.begin("kitchen", false);
+  int saved = prefs.getInt("gas_th", GAS_TH_DEFAULT);
+  if (saved < GAS_TH_MIN || saved > GAS_TH_MAX) saved = GAS_TH_DEFAULT;
+  gasThreshold = saved;
+  Serial.printf("Gas threshold loaded: %d\n", gasThreshold);
+}
+
+// Goi trong loop(): ap dung nguong moi nhan duoc tu callback
+void applyPendingGasThreshold()
+{
+  int th = pendingGasTh;
+  if (th == -1) return;
+  pendingGasTh = -1;
+
+  if (th < GAS_TH_MIN || th > GAS_TH_MAX) {
+    Serial.printf("Gas threshold %d ngoai khoang %d..%d, bo qua\n", th, GAS_TH_MIN, GAS_TH_MAX);
+    return;
+  }
+
+  if (th != gasThreshold) {
+    gasThreshold = th;
+    prefs.putInt("gas_th", gasThreshold);   // chi ghi flash khi gia tri that su doi
+  }
+  Serial.printf("Gas threshold set: %d\n", gasThreshold);
+
+  // Danh gia lai va gui telemetry ngay de gateway/app thay gia tri moi
+  lastSensorMs = millis() - SENSOR_INTERVAL_MS;
+}
+
 // ===================== COMMAND HANDLING =====================
 void applyCommand(const char *command)
 {
@@ -262,6 +306,8 @@ void applyCommand(const char *command)
     ledOverride = false;
   } else if (strcmp(command, "OTA") == 0) {
     otaRequested = true;  // chi dat co, loop() se xu ly
+  } else if (strncmp(command, "GAS_TH=", 7) == 0) {
+    pendingGasTh = atoi(command + 7);   // chi dat co, loop() kiem tra khoang va ghi flash
   }
 }
 
@@ -291,7 +337,9 @@ void readSensor(float &t, float &h, int &gasRaw, float &gasVoltage)
 {
   t = dht.getTemperature();
   h = dht.getHumidity();
-  gasRaw = analogRead(MQ2_PIN);
+  float mq2_offset = 27; // Offset value for MQ2 sensor calibration
+  gasRaw = analogRead(MQ2_PIN) - mq2_offset;
+  if (gasRaw < 0) gasRaw = 0;
   gasVoltage = gasRaw * (3.3f / 4095.0f);
 }
 
@@ -304,6 +352,7 @@ void sendData(float t, float h, int gasRaw, float gasVoltage)
   sensorData.fan = fanState;
   sensorData.led = ledState;
   sensorData.alarm = alertMode;
+  sensorData.gas_threshold = (float)gasThreshold;   // bao lai nguong that su dang dung
 
   esp_now_send(gatewayMAC, (uint8_t *)&sensorData, sizeof(sensorData));
 }
@@ -415,6 +464,8 @@ void setup()
 
   dht.setup(DHTPIN, DHT::DHT22);
 
+  loadGasThreshold();   // doc nguong da luu truoc khi bat dau danh gia gas
+
   initESPNow();
   Serial.println("KITCHEN NODE READY");
 }
@@ -433,6 +484,9 @@ void loop()
     }
     return;
   }
+
+  // --- Ap dung nguong gas moi (neu co) truoc khi danh gia ---
+  applyPendingGasThreshold();
 
   // --- Nut nhan + LED do nhap nhay: quet lien tuc ---
   handleButtons();
@@ -458,10 +512,10 @@ void loop()
     ledOverride = false;
   }
 
-  gasDanger = gasRaw >= GAS_RAW_THRESHOLD;
+  gasDanger = gasRaw >= gasThreshold;
 
-  Serial.printf("T=%.1f H=%.1f GAS_RAW=%d GAS=%.2fV DANGER=%d FAN=%d LED=%d | fanMan=%d ledMan=%d gwMan=%d\n",
-                t, h, gasRaw, gasVoltage, gasDanger ? 1 : 0,
+  Serial.printf("T=%.1f H=%.1f GAS_RAW=%d GAS=%.2fV TH=%d DANGER=%d FAN=%d LED=%d | fanMan=%d ledMan=%d gwMan=%d\n",
+                t, h, gasRaw, gasVoltage, gasThreshold, gasDanger ? 1 : 0,
                 fanState ? 1 : 0, ledState ? 1 : 0,
                 fanOverride ? 1 : 0, ledOverride ? 1 : 0, manualMode ? 1 : 0);
 
