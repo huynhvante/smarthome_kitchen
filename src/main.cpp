@@ -4,6 +4,8 @@
 #include <esp_now.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 // ===================== PIN / PWM =====================
 #define DHTPIN 4
@@ -30,7 +32,11 @@
 #define PWM_B 1
 #define PWM_FREQ 5000
 #define PWM_RES 8
-#define FAN_SPEED 200
+constexpr uint8_t FAN_HIGH = 3;
+constexpr uint8_t FAN_PWM[] = {0, 100, 150, 200};  // Tắt, nhẹ, trung bình, mạnh.
+constexpr unsigned long FAN_RAMP_MS = 300UL;
+constexpr unsigned long FAN_START_HOLD_MS = 120UL;
+constexpr unsigned long FAN_TAP_GAP_MS = 500UL;
 
 #define SENSOR_INTERVAL_MS 2000UL
 #define FAN_OFF_DELAY_MS 60000UL
@@ -70,11 +76,16 @@ typedef struct __attribute__((packed)) {
 } ControlData;
 
 SensorData sensorData;
+constexpr unsigned int COMMAND_QUEUE_DEPTH = 16;
+QueueHandle_t commandQueue = nullptr;
 
 bool manualMode = false;   // manual tu gateway
 bool alertMode = false;
 bool gasDanger = false;    // cap nhat moi chu ky 2s
-bool fanState = false;
+uint8_t fanLevel = 0;
+uint8_t fanDuty = 0;
+bool fanStarting = false;
+unsigned long fanStartMs = 0;
 bool ledState = false;     // trang thai LED TRANG (chieu sang)
 unsigned long lastSensorMs = 0;
 
@@ -83,7 +94,9 @@ int gasThreshold = GAS_TH_DEFAULT;
 volatile int pendingGasTh = -1;   // dat trong callback ESP-NOW, xu ly trong loop() (khong ghi flash trong callback)
 
 // ---- Ghi de tu nut nhan (manual) ----
-bool fanOverride = false;
+// Room cho quạt theo chế độ chung của bếp khi dùng các lệnh gateway cũ.
+enum class FanMode { Room, Auto, Button, Gateway };
+FanMode fanMode = FanMode::Room;
 bool ledOverride = false;
 unsigned long lastButtonMs = 0;
 
@@ -91,10 +104,13 @@ unsigned long lastButtonMs = 0;
 struct PreAlarmSnapshot
 {
   bool valid;
-  bool manualMode, fanOverride, ledOverride;
-  bool fan, led;
+  bool manualMode;
+  FanMode fanMode;
+  bool ledOverride;
+  uint8_t fanLevel;
+  bool led;
 };
-PreAlarmSnapshot preAlarm = {false, false, false, false, false, false};
+PreAlarmSnapshot preAlarm = {};
 
 // ---- Nhap nhay LED do ----
 bool redBlinkState = false;
@@ -142,6 +158,9 @@ struct Button {
 
 Button btnLed = {BTN_LED_SIG2, HIGH, HIGH, 0, 0, false};
 Button btnFan = {BTN_FAN_SIG2, HIGH, HIGH, 0, 0, false};
+uint8_t fanTapCount = 0;
+unsigned long lastFanReleaseMs = 0;
+bool ignoreFanUntilRelease = false;
 
 // Nhan ngan: tra ve BTN_SHORT khi tha nut.
 // Nhan giu: tra ve BTN_LONG ngay khi du thoi gian (khi dang giu).
@@ -174,23 +193,52 @@ BtnEvent readButton(Button &b)
 }
 
 // ===================== ACTUATORS =====================
-void fanOn()
+void updateFanPwm()
 {
-  if (fanState) return;
-  ledcWrite(PWM_A, 0);
-  for (int speed = 0; speed <= FAN_SPEED; speed += 10)
-  {
-    ledcWrite(PWM_B, speed);
-    delay(15);
+  uint8_t duty = FAN_PWM[fanLevel];
+  if (fanStarting) {
+    const unsigned long elapsed = millis() - fanStartMs;
+    if (elapsed < FAN_RAMP_MS) {
+      duty = static_cast<uint8_t>(FAN_PWM[FAN_HIGH] * elapsed / FAN_RAMP_MS);
+    } else if (elapsed < FAN_RAMP_MS + FAN_START_HOLD_MS) {
+      duty = FAN_PWM[FAN_HIGH];
+    } else {
+      fanStarting = false;
+    }
   }
-  fanState = true;
+
+  if (duty != fanDuty) {
+    ledcWrite(PWM_B, duty);
+    fanDuty = duty;
+  }
 }
 
-void fanOff()
+void setFanLevel(uint8_t level)
 {
-  ledcWrite(PWM_A, 0);
-  ledcWrite(PWM_B, 0);
-  fanState = false;
+  if (level > FAN_HIGH || level == fanLevel) return;
+  if (level == 0) {
+    fanStarting = false;
+  } else if (fanLevel == 0) {
+    // Khởi động êm đến mức quạt đã chạy ổn, rồi hạ xuống mức đã chọn.
+    fanStartMs = millis();
+    fanStarting = true;
+  }
+  fanLevel = level;
+  updateFanPwm();
+}
+
+void fanOn()  { setFanLevel(FAN_HIGH); }
+void fanOff() { setFanLevel(0); }
+
+bool fanIsAuto()
+{
+  return fanMode == FanMode::Auto || (fanMode == FanMode::Room && !manualMode);
+}
+
+void cancelFanGesture()
+{
+  fanTapCount = 0;
+  ignoreFanUntilRelease = btnFan.stableState == LOW || digitalRead(btnFan.pin) == LOW;
 }
 
 // LED trang (chieu sang)
@@ -226,22 +274,32 @@ void updateRedLed()
   }
 }
 
-// Den tren CA 2 NUT deu theo trang thai LED trang:
-// LED tat -> 2 den nut sang (SIG1 = HIGH); LED bat -> 2 den nut tat.
-void updateButtonLamps()
-{
-  bool lampOn = !ledState;
-  digitalWrite(BTN_LED_SIG1, lampOn ? HIGH : LOW);
-  digitalWrite(BTN_FAN_SIG1, lampOn ? HIGH : LOW);
-}
+// Chớp ba nhịp khi về AUTO. Vòng loop vẫn cập nhật PWM trong lúc chớp.
+struct LampBlink {
+  bool active;
+  unsigned long startMs;
+};
+LampBlink ledBlink = {}, fanBlink = {};
 
-// Nhay den trong nut 3 lan de bao "da ve tu dong"
 void blinkLamp(uint8_t pin)
 {
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(pin, HIGH); delay(100);
-    digitalWrite(pin, LOW);  delay(100);
-  }
+  LampBlink &blink = (pin == BTN_LED_SIG1) ? ledBlink : fanBlink;
+  blink = {true, millis()};
+}
+
+void updateButtonLamp(uint8_t pin, LampBlink &blink, unsigned long now)
+{
+  const unsigned long elapsed = now - blink.startMs;
+  if (elapsed >= 600UL) blink.active = false;
+  const bool on = blink.active ? (elapsed / 100UL) % 2 == 0 : !ledState;
+  digitalWrite(pin, on ? HIGH : LOW);
+}
+
+void updateButtonLamps()
+{
+  const unsigned long now = millis();
+  updateButtonLamp(BTN_LED_SIG1, ledBlink, now);
+  updateButtonLamp(BTN_FAN_SIG1, fanBlink, now);
 }
 
 // ===================== SNAPSHOT TRUOC BAO DONG =====================
@@ -250,7 +308,8 @@ void blinkLamp(uint8_t pin)
 void snapshotBeforeAlarm()
 {
   if (preAlarm.valid) return;
-  preAlarm = {true, manualMode, fanOverride, ledOverride, fanState, ledState};
+  preAlarm = {true, manualMode, fanMode, ledOverride, fanLevel, ledState};
+  cancelFanGesture();
 }
 
 // Het bao dong (ca ALERT_OFF lan gas ve binh thuong): khoi phuc trang thai truoc do.
@@ -261,14 +320,11 @@ void restoreAfterAlarm()
   preAlarm.valid = false;
 
   manualMode  = snap.manualMode;
-  fanOverride = snap.fanOverride;
+  fanMode     = snap.fanMode;
   ledOverride = snap.ledOverride;
 
-  // Thiet bi dang manual: tra dung ON/OFF truoc bao dong
-  // (thiet bi o auto de loop() tu danh gia: bep o auto thi tat)
-  if (manualMode || fanOverride) {
-    if (snap.fan) fanOn(); else fanOff();
-  }
+  // Khôi phục đúng mức quạt thủ công. Quạt AUTO được xét lại theo gas trong loop.
+  if (!fanIsAuto()) setFanLevel(snap.fanLevel);
   if (manualMode || ledOverride) {
     if (snap.led) ledOn(); else ledOff();
   }
@@ -286,6 +342,7 @@ void handleButtons()
 
   // An toan: dang bao dong thi bo qua nut
   if (isAlarmActive()) {
+    cancelFanGesture();
     if (eled != BTN_NONE || efan != BTN_NONE) {
       Serial.println("Alarm active: ignore button press");
     }
@@ -306,18 +363,33 @@ void handleButtons()
     Serial.println("Button LED -> AUTO");
   }
 
-  // ---- Nut xanh: quat ----
-  if (efan == BTN_SHORT) {
-    fanOverride = true;
-    lastButtonMs = millis();
-    if (fanState) fanOff(); else fanOn();
-    Serial.printf("Button FAN -> %s (MANUAL)\n", fanState ? "ON" : "OFF");
-  } else if (efan == BTN_LONG) {
-    fanOverride = false;
+  // ---- Nút xanh: đếm cụm nhấn để chọn mức quạt ----
+  if (ignoreFanUntilRelease) {
+    if (btnFan.stableState == HIGH && btnFan.lastReading == HIGH) ignoreFanUntilRelease = false;
+    return;
+  }
+  if (efan == BTN_LONG) {
+    fanTapCount = 0;
+    fanMode = FanMode::Room;
     manualMode = false;
     blinkLamp(BTN_FAN_SIG1);
     lastSensorMs = millis() - SENSOR_INTERVAL_MS;
     Serial.println("Button FAN -> AUTO");
+  } else if (efan == BTN_SHORT) {
+    if (fanTapCount <= FAN_HIGH) ++fanTapCount;
+    lastFanReleaseMs = millis();
+  }
+  if (fanTapCount && btnFan.stableState == HIGH && btnFan.lastReading == HIGH &&
+      millis() - lastFanReleaseMs >= FAN_TAP_GAP_MS) {
+    const uint8_t taps = fanTapCount;
+    fanTapCount = 0;
+    if (taps <= FAN_HIGH) {
+      const bool turnOff = taps == 1 && !fanIsAuto() && fanLevel != 0;
+      fanMode = FanMode::Button;
+      lastButtonMs = millis();
+      setFanLevel(turnOff ? 0 : taps);
+      Serial.printf("Button FAN -> level %u\n", static_cast<unsigned>(fanLevel));
+    }
   }
 }
 
@@ -357,21 +429,34 @@ void applyPendingGasThreshold()
 // ===================== COMMAND HANDLING =====================
 void applyCommand(const char *command)
 {
+  const bool levelCommand = strncmp(command, "FAN_", 4) == 0 &&
+      command[4] >= '0' && command[4] <= '3' && command[5] == '\0';
+  const bool fanAuto = strcmp(command, "FAN_AUTO") == 0;
+  const bool on = strcmp(command, "FAN_ON") == 0 || strcmp(command, "ON") == 0;
+  const bool off = strcmp(command, "FAN_OFF") == 0 || strcmp(command, "OFF") == 0;
+
   // Dang bao dong: chan lenh den/quat thu cong
-  if (isAlarmActive() &&
-      (strcmp(command, "FAN_ON") == 0  || strcmp(command, "ON") == 0  ||
-       strcmp(command, "FAN_OFF") == 0 || strcmp(command, "OFF") == 0 ||
+  if (isAlarmActive() && (levelCommand || fanAuto || on || off ||
        strcmp(command, "LED_ON") == 0  || strcmp(command, "LED_OFF") == 0)) {
     Serial.println("Alarm active: ignore device command");
     return;
   }
 
-  if (strcmp(command, "FAN_ON") == 0 || strcmp(command, "ON") == 0) {
-    manualMode = true;
-    fanOn();
-  } else if (strcmp(command, "FAN_OFF") == 0 || strcmp(command, "OFF") == 0) {
-    manualMode = true;
-    fanOff();
+  if (levelCommand || on || off) {
+    cancelFanGesture();
+    uint8_t level = on ? FAN_HIGH : 0;
+    if (levelCommand) {
+      fanMode = FanMode::Gateway;
+      level = static_cast<uint8_t>(command[4] - '0');
+    } else {
+      manualMode = true;
+      if (fanMode != FanMode::Button) fanMode = FanMode::Room;
+    }
+    setFanLevel(level);
+  } else if (fanAuto) {
+    cancelFanGesture();
+    fanMode = FanMode::Auto;
+    lastSensorMs = millis() - SENSOR_INTERVAL_MS;
   } else if (strcmp(command, "LED_ON") == 0) {
     manualMode = true;
     ledOn();
@@ -390,11 +475,13 @@ void applyCommand(const char *command)
     alertMode = false;
     lastSensorMs = millis() - SENSOR_INTERVAL_MS;   // danh gia lai ngay
   } else if (strcmp(command, "AUTO") == 0) {
+    cancelFanGesture();
     preAlarm.valid = false;           // lenh AUTO tuong minh thang snapshot
     manualMode = false;
     alertMode = false;
-    fanOverride = false;
+    fanMode = FanMode::Room;
     ledOverride = false;
+    lastSensorMs = millis() - SENSOR_INTERVAL_MS;
   } else if (strcmp(command, "OTA") == 0) {
     otaRequested = true;  // chi dat co, loop() se xu ly
   } else if (strncmp(command, "GAS_TH=", 7) == 0) {
@@ -404,7 +491,7 @@ void applyCommand(const char *command)
 
 void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
 {
-  if (len != sizeof(ControlData)) {
+  if (len != sizeof(ControlData) || commandQueue == nullptr) {
     return;
   }
 
@@ -412,9 +499,20 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
   memcpy(&cmd, incomingData, sizeof(cmd));
   cmd.command[sizeof(cmd.command) - 1] = '\0';
 
-  Serial.print("Command: ");
-  Serial.println(cmd.command);
-  applyCommand(cmd.command);
+  // Chỉ vòng loop thay đổi PWM, mức quạt và trạng thái báo động.
+  if (xQueueSend(commandQueue, &cmd, 0) != pdTRUE) {
+    Serial.println("ESP-NOW command queue full");
+  }
+}
+
+void handleNextCommand()
+{
+  ControlData cmd;
+  if (commandQueue && xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+    Serial.print("Command: ");
+    Serial.println(cmd.command);
+    applyCommand(cmd.command);
+  }
 }
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
@@ -440,7 +538,7 @@ void sendData(float t, float h, int gasRaw, float gasVoltage)
   sensorData.humid = h;
   sensorData.gas_voltage = gasVoltage;
   sensorData.gas_raw = gasRaw;
-  sensorData.fan = fanState;
+  sensorData.fan = fanLevel != 0;
   sensorData.led = ledState;
   sensorData.alarm = alertMode;
   sensorData.gas_threshold = (float)gasThreshold;   // bao lai nguong that su dang dung
@@ -460,7 +558,9 @@ void initESPNow()
     while (true);
   }
 
-  esp_now_register_recv_cb(OnDataRecv);
+  commandQueue = xQueueCreate(COMMAND_QUEUE_DEPTH, sizeof(ControlData));
+  if (commandQueue) esp_now_register_recv_cb(OnDataRecv);
+  else Serial.println("ESP-NOW command queue unavailable");
   esp_now_register_send_cb(OnDataSent);
 
   esp_now_peer_info_t peerInfo = {};
@@ -485,6 +585,8 @@ void enterOtaMode()
   alertMode = false;
   gasDanger = false;
   preAlarm.valid = false;
+  ledBlink.active = false;
+  fanBlink.active = false;
   fanOff();
   ledOff();
   digitalWrite(LED_RED_PIN, LOW);
@@ -550,7 +652,8 @@ void setup()
   ledcSetup(PWM_B, PWM_FREQ, PWM_RES);
   ledcAttachPin(INA, PWM_A);
   ledcAttachPin(INB, PWM_B);
-  fanOff();
+  ledcWrite(PWM_A, 0);
+  ledcWrite(PWM_B, 0);
 
   updateButtonLamps();
 
@@ -564,6 +667,7 @@ void setup()
 
 void loop()
 {
+  if (!otaMode) handleNextCommand();
   // --- Che do OTA: chi phuc vu upload, het han thi khoi dong lai ---
   if (otaRequested && !otaMode) {
     enterOtaMode();
@@ -582,6 +686,7 @@ void loop()
 
   // --- Nut nhan + LED do nhap nhay: quet lien tuc ---
   handleButtons();
+  updateFanPwm();
   updateButtonLamps();
   updateRedLed();
 
@@ -609,27 +714,27 @@ void loop()
   // Tu tra ve auto neu qua lau khong nhan nut (OVERRIDE_RELEASE_MS = 0: tat tinh nang nay)
   // Khong ap dung khi dang bao dong. So sanh co dau de khong bi tran khi lastButtonMs
   // vua duoc dat lai (lon hon 'now' mot chut).
-  if (OVERRIDE_RELEASE_MS > 0 && !alarmNow && (fanOverride || ledOverride) &&
+  if (OVERRIDE_RELEASE_MS > 0 && !alarmNow && (fanMode == FanMode::Button || ledOverride) &&
       (long)(now - lastButtonMs) >= (long)OVERRIDE_RELEASE_MS) {
     Serial.println("Override timeout: back to AUTO");
-    fanOverride = false;
+    if (fanMode == FanMode::Button) fanMode = FanMode::Room;
     ledOverride = false;
   }
 
   Serial.printf("T=%.1f H=%.1f GAS_RAW=%d GAS=%.2fV TH=%d DANGER=%d FAN=%d LED=%d | fanMan=%d ledMan=%d gwMan=%d\n",
                 t, h, gasRaw, gasVoltage, gasThreshold, gasDanger ? 1 : 0,
-                fanState ? 1 : 0, ledState ? 1 : 0,
-                fanOverride ? 1 : 0, ledOverride ? 1 : 0, manualMode ? 1 : 0);
+                fanLevel != 0 ? 1 : 0, ledState ? 1 : 0,
+                fanMode == FanMode::Button ? 1 : 0, ledOverride ? 1 : 0,
+                (manualMode || fanMode == FanMode::Gateway) ? 1 : 0);
 
   if (alarmNow) {
     // AN TOAN: canh bao luon bat quat + den trang, bat ke manual hay nut nhan
     // (LED do nhap nhay do updateRedLed() xu ly)
     fanOn();
     ledOn();
-  } else if (!manualMode) {
-    // Binh thuong: chi tu dong khi nut tuong ung KHONG o manual
-    if (!fanOverride) fanOff();
-    if (!ledOverride) ledOff();
+  } else {
+    if (fanIsAuto()) fanOff();
+    if (!manualMode && !ledOverride) ledOff();
   }
 
   updateButtonLamps();
